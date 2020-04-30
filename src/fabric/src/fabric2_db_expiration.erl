@@ -39,16 +39,7 @@ start_link() ->
 
 
 init(_) ->
-    case wait_couch_job() of
-        ok -> ok;
-        retry -> wait_couch_job()
-    end,
-    case is_enabled() of
-        true ->
-            process_expiration();
-        false ->
-            ok
-    end,
+    start_timer(),
     {ok, nil}.
 
 
@@ -60,6 +51,24 @@ handle_call(Msg, _From, St) ->
     {stop, {bad_call, Msg}, {bad_call, Msg}, St}.
 
 
+handle_cast(timeout, St) ->
+    proc_lib:init_ack({ok, self()}),
+    try
+        couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
+        case add_or_get_job() of
+            ok -> ok;
+            retry -> add_or_get_job()
+        end,
+        case run_loop() of
+            ok -> ok;
+            retry -> run_loop()
+        end,
+        {noreply, St}
+    catch
+        _:_->
+            start_timer(),
+            {noreply, St}
+    end;
 handle_cast(Msg, St) ->
     {stop, {bad_cast, Msg}, St}.
 
@@ -72,17 +81,46 @@ code_change(_OldVsn, St, _Extra) ->
     {ok, St}.
 
 
-wait_couch_job() ->
-    try
-        couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
-        couch_jobs:add(undefined, ?DB_EXPIRATION_JOB_TYPE, ?DB_EXPIRATION_JOB, #{}),
-        {ok, _Job, _JobData} = couch_jobs:accept(?DB_EXPIRATION_JOB_TYPE,
-            #{max_sched_time => 1000}),
-        ok
-    catch
-        error:badarg ->
-            retry
+start_timer() ->
+    After = 10,
+    case timer:apply_after(After, gen_server, cast, [self(), timeout]) of
+        {ok, Ref} ->
+            Ref;
+        _Error ->
+            nil
     end.
+
+
+add_or_get_job() ->
+    couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
+    case couch_jobs:get_job_data(
+        undefined,
+        ?DB_EXPIRATION_JOB_TYPE,
+        ?DB_EXPIRATION_JOB
+    ) of
+        {error, not_found} ->
+            couch_jobs:add(
+                undefined,
+                ?DB_EXPIRATION_JOB_TYPE,
+                ?DB_EXPIRATION_JOB,
+                #{}
+            );
+        {ok, _JobData} ->
+            ok
+    end.
+
+
+run_loop() ->
+    {ok, Job, JobData} = couch_jobs:accept(?DB_EXPIRATION_JOB_TYPE),
+    case is_enabled() of
+        true ->
+            process_expiration();
+        false ->
+            ok
+    end,
+    Now = erlang:system_time(second),
+    couch_jobs:resubmit(undefined, Job, Now + schedule_sec(), JobData),
+    run_loop().
 
 
 process_expiration() ->
@@ -168,6 +206,11 @@ is_enabled() ->
 retention_sec() ->
     config:get_integer("couch", "db_expiration_retention_sec",
         ?DEFAULT_RETENTION_SEC).
+
+
+schedule_sec() ->
+    config:get_integer("couch", "db_expiration_schedule_sec",
+        ?DEFAULT_SCHEDULE_SEC).
 
 
 expiration_batch() ->
