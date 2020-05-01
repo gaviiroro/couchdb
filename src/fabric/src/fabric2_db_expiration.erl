@@ -34,6 +34,11 @@
 -include_lib("fabric/include/fabric2.hrl").
 
 
+-record(st, {
+    acceptor
+}).
+
+
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -61,11 +66,20 @@ handle_info(timeout, St) ->
     end,
     couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
     add_or_get_job(),
-    case run_loop() of
-        ok -> ok;
-        retry -> run_loop()
+    {_Pid, Ref} = spawn_to_accept(),
+    {noreply, St#st{acceptor = Ref}};
+handle_info({'DOWN', Ref, process, _Pid, {exit_ok, Resp}}, #st{acceptor=Ref} = St) ->
+    case is_enabled() of
+        true ->
+            process_expiration();
+        false ->
+            ok
     end,
-    {noreply, St};
+    Now = erlang:system_time(second),
+    {ok, Job, JobData} = Resp,
+    couch_jobs:resubmit(undefined, Job, Now + schedule_sec(), JobData),
+    {_Pid, Ref} = spawn_to_accept(),
+    {noreply, St#st{acceptor = Ref}};
 handle_info(Msg, St) ->
     {stop, {bad_info, Msg}, St}.
 
@@ -100,17 +114,16 @@ add_or_get_job() ->
     end.
 
 
-run_loop() ->
-    {ok, Job, JobData} = couch_jobs:accept(?DB_EXPIRATION_JOB_TYPE),
-    case is_enabled() of
-        true ->
-            process_expiration();
-        false ->
-            ok
-    end,
-    Now = erlang:system_time(second),
-    couch_jobs:resubmit(undefined, Job, Now + schedule_sec(), JobData),
-    run_loop().
+spawn_to_accept() ->
+    spawn_monitor(fun() ->
+        try couch_jobs:accept(?DB_EXPIRATION_JOB_TYPE, #{max_scheduled_time => now_sec()}) of
+            Resp ->
+                exit({exit_ok, Resp})
+        catch
+            _:Reason ->
+            exit({exit_error, Reason})
+        end
+    end).
 
 
 process_expiration() ->
