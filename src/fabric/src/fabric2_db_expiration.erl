@@ -39,8 +39,7 @@ start_link() ->
 
 
 init(_) ->
-    start_timer(),
-    {ok, nil}.
+    {ok, nil, 0}.
 
 
 terminate(_M, _St) ->
@@ -51,28 +50,22 @@ handle_call(Msg, _From, St) ->
     {stop, {bad_call, Msg}, {bad_call, Msg}, St}.
 
 
-handle_cast(timeout, St) ->
-    proc_lib:init_ack({ok, self()}),
-    try
-        couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
-        case add_or_get_job() of
-            ok -> ok;
-            retry -> add_or_get_job()
-        end,
-        case run_loop() of
-            ok -> ok;
-            retry -> run_loop()
-        end,
-        {noreply, St}
-    catch
-        _:_->
-            start_timer(),
-            {noreply, St}
-    end;
 handle_cast(Msg, St) ->
     {stop, {bad_cast, Msg}, St}.
 
 
+handle_info(timeout, St) ->
+    case wait_for_couch_jobs_app() of
+        ok -> ok;
+        retry -> wait_for_couch_jobs_app()
+    end,
+    couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
+    add_or_get_job(),
+    case run_loop() of
+        ok -> ok;
+        retry -> run_loop()
+    end,
+    {noreply, St};
 handle_info(Msg, St) ->
     {stop, {bad_info, Msg}, St}.
 
@@ -81,13 +74,10 @@ code_change(_OldVsn, St, _Extra) ->
     {ok, St}.
 
 
-start_timer() ->
-    After = 10,
-    case timer:apply_after(After, gen_server, cast, [self(), timeout]) of
-        {ok, Ref} ->
-            Ref;
-        _Error ->
-            nil
+wait_for_couch_jobs_app() ->
+    case lists:keysearch(couch_jobs, 1, application:which_applications()) of
+        {value, {couch_jobs, _Value}} -> ok;
+        false -> retry
     end.
 
 
@@ -137,7 +127,7 @@ process_expiration() ->
                     delete_dbs(lists:sublist(Acc, TotalLen - LastDelete)),
                     Acc
                 end
-            end,
+        end,
         {ok, NewAcc}
     end,
     {ok, _Infos} = fabric2_db:list_deleted_dbs_info(Callback, [], []).
