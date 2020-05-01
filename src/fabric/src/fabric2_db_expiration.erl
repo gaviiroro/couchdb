@@ -17,7 +17,8 @@
 
 
 -export([
-    start_link/0
+    start_link/0,
+    accept_job/0
 ]).
 
 -export([
@@ -44,7 +45,7 @@ start_link() ->
 
 
 init(_) ->
-    {ok, nil, 0}.
+    {ok, nil, 5000}.
 
 
 terminate(_M, _St) ->
@@ -66,7 +67,7 @@ handle_info(timeout, St) ->
     end,
     couch_jobs:set_type_timeout(?DB_EXPIRATION_JOB_TYPE, 6),
     add_or_get_job(),
-    {_Pid, Ref} = spawn_to_accept(),
+    {_Pid, Ref} = spawn_monitor(?MODULE, accept_job, []),
     {noreply, St#st{acceptor = Ref}};
 handle_info({'DOWN', Ref, process, _Pid, {exit_ok, Resp}}, #st{acceptor=Ref} = St) ->
     case is_enabled() of
@@ -78,7 +79,7 @@ handle_info({'DOWN', Ref, process, _Pid, {exit_ok, Resp}}, #st{acceptor=Ref} = S
     Now = erlang:system_time(second),
     {ok, Job, JobData} = Resp,
     couch_jobs:resubmit(undefined, Job, Now + schedule_sec(), JobData),
-    {_Pid, Ref} = spawn_to_accept(),
+    {_Pid, Ref} = spawn_monitor(?MODULE, accept_job, []),
     {noreply, St#st{acceptor = Ref}};
 handle_info(Msg, St) ->
     {stop, {bad_info, Msg}, St}.
@@ -91,7 +92,9 @@ code_change(_OldVsn, St, _Extra) ->
 wait_for_couch_jobs_app() ->
     case lists:keysearch(couch_jobs, 1, application:which_applications()) of
         {value, {couch_jobs, _Value}} -> ok;
-        false -> retry
+        false ->
+            timer:sleep(1000),
+            retry
     end.
 
 
@@ -114,16 +117,14 @@ add_or_get_job() ->
     end.
 
 
-spawn_to_accept() ->
-    spawn_monitor(fun() ->
-        try couch_jobs:accept(?DB_EXPIRATION_JOB_TYPE, #{max_scheduled_time => now_sec()}) of
-            Resp ->
-                exit({exit_ok, Resp})
-        catch
-            _:Reason ->
+accept_job() ->
+    try couch_jobs:accept(?DB_EXPIRATION_JOB_TYPE) of
+        Resp ->
+            exit({exit_ok, Resp})
+    catch
+        _:Reason ->
             exit({exit_error, Reason})
-        end
-    end).
+    end.
 
 
 process_expiration() ->
